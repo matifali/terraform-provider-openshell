@@ -9,6 +9,21 @@ terraform {
   }
 }
 
+# ---------------------------------------------------------------------------
+# Template: User-facing coding agent sandbox
+#
+# The developer launches Claude Code, Codex, or any coding agent inside
+# an OpenShell sandbox. The sandbox provides:
+#   - Filesystem isolation (Landlock) — agent can't read ~/.ssh, etc.
+#   - Network allow-list — agent can only reach approved endpoints
+#   - Credential proxy — API keys are never visible inside the sandbox
+#   - Inference routing — LLM calls can be routed to self-hosted models
+#
+# The developer connects via SSH / VS Code / JetBrains as usual.
+# When they run `claude` or `codex` inside the workspace, it just works
+# because OpenShell's credential proxy transparently injects the API key.
+# ---------------------------------------------------------------------------
+
 locals {
   username = data.coder_workspace_owner.me.name
 }
@@ -18,8 +33,8 @@ locals {
 # ---------------------------------------------------------------------------
 
 data "coder_parameter" "gateway_url" {
-  name         = "OpenShell Gateway"
-  display_name = "OpenShell Gateway URL"
+  name         = "openshell_gateway"
+  display_name = "OpenShell Gateway"
   description  = "gRPC endpoint of the OpenShell gateway."
   type         = "string"
   default      = "localhost:8443"
@@ -27,26 +42,26 @@ data "coder_parameter" "gateway_url" {
 }
 
 data "coder_parameter" "image" {
-  name         = "Sandbox Image"
+  name         = "image"
   display_name = "Container Image"
-  description  = "The container image for the sandbox."
   type         = "string"
   default      = "codercom/enterprise-base:ubuntu"
   mutable      = false
 }
 
 data "coder_parameter" "gpu" {
-  name         = "GPU"
-  display_name = "Enable GPU passthrough"
+  name         = "gpu"
+  display_name = "Enable GPU"
+  description  = "Pass host GPUs into the sandbox for local inference."
   type         = "bool"
   default      = "false"
   mutable      = false
 }
 
-data "coder_parameter" "ai_provider" {
-  name         = "AI Provider"
-  display_name = "AI Agent Provider"
-  description  = "Which AI agent credential provider to attach."
+data "coder_parameter" "coding_agent" {
+  name         = "coding_agent"
+  display_name = "Coding Agent"
+  description  = "Which coding agent to pre-configure. OpenShell auto-creates the credential provider and injects it into the sandbox."
   type         = "string"
   default      = "none"
   option {
@@ -54,7 +69,7 @@ data "coder_parameter" "ai_provider" {
     value = "none"
   }
   option {
-    name  = "Claude (Anthropic)"
+    name  = "Claude Code"
     value = "claude"
   }
   option {
@@ -62,15 +77,16 @@ data "coder_parameter" "ai_provider" {
     value = "openai"
   }
   option {
-    name  = "Copilot (GitHub)"
+    name  = "GitHub Copilot"
     value = "github"
   }
 }
 
-# Sensitive — only prompted when an AI provider is selected.
-data "coder_parameter" "ai_api_key" {
-  name         = "AI API Key"
-  display_name = "API Key for the selected AI provider"
+# Only shown when a coding agent is selected.
+data "coder_parameter" "api_key" {
+  name         = "api_key"
+  display_name = "API Key"
+  description  = "API key for the selected coding agent. Injected via OpenShell's credential proxy — the agent never sees the real key."
   type         = "string"
   default      = ""
   mutable      = true
@@ -83,10 +99,8 @@ data "coder_parameter" "ai_api_key" {
 
 provider "openshell" {
   gateway_url = data.coder_parameter.gateway_url.value
-
-  # For local gateways, the CLI auto-provisions mTLS certs.
-  # For remote gateways, set OPENSHELL_TOKEN in the environment.
-  insecure = false
+  # mTLS certs auto-resolved from ~/.openshell/tls/ for local gateways.
+  # For remote gateways, set OPENSHELL_TOKEN in the provisioner env.
 }
 
 data "coder_provisioner" "me" {}
@@ -94,36 +108,42 @@ data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
 
 # ---------------------------------------------------------------------------
-# Credential provider (created only when an AI agent is selected)
+# Credential provider
+#
+# Created only when the developer selects a coding agent. OpenShell stores
+# the API key on the gateway and injects a placeholder token into the
+# sandbox at runtime. The coding agent (Claude, Codex, etc.) sees the
+# placeholder in its environment and uses it normally. When the agent
+# makes an API call, OpenShell's proxy swaps the placeholder for the
+# real key before forwarding. The real key never touches the sandbox.
 # ---------------------------------------------------------------------------
 
 locals {
-  has_ai_provider = data.coder_parameter.ai_provider.value != "none"
+  has_agent = data.coder_parameter.coding_agent.value != "none"
 
-  # Map the parameter value to OpenShell provider type and env var name.
-  provider_config = {
-    claude = { type = "claude", key_name = "ANTHROPIC_API_KEY" }
-    openai = { type = "openai", key_name = "OPENAI_API_KEY" }
-    github = { type = "github", key_name = "GITHUB_TOKEN" }
-    none   = { type = "", key_name = "" }
+  agent_config = {
+    claude = { type = "claude", env_var = "ANTHROPIC_API_KEY" }
+    openai = { type = "openai", env_var = "OPENAI_API_KEY" }
+    github = { type = "github", env_var = "GITHUB_TOKEN" }
+    none   = { type = "", env_var = "" }
   }
 
-  selected_provider = local.provider_config[data.coder_parameter.ai_provider.value]
+  selected = local.agent_config[data.coder_parameter.coding_agent.value]
 }
 
-resource "openshell_provider" "ai" {
-  count = local.has_ai_provider ? 1 : 0
+resource "openshell_provider" "agent" {
+  count = local.has_agent ? 1 : 0
 
-  name = "${local.username}-${data.coder_workspace.me.name}-${data.coder_parameter.ai_provider.value}"
-  type = local.selected_provider.type
+  name = "${local.username}-${data.coder_workspace.me.name}-${local.selected.type}"
+  type = local.selected.type
 
   credentials = {
-    (local.selected_provider.key_name) = data.coder_parameter.ai_api_key.value
+    (local.selected.env_var) = data.coder_parameter.api_key.value
   }
 }
 
 # ---------------------------------------------------------------------------
-# Coder agent (runs inside the OpenShell sandbox)
+# Coder agent
 # ---------------------------------------------------------------------------
 
 resource "coder_agent" "main" {
@@ -169,7 +189,6 @@ resource "coder_agent" "main" {
   }
 }
 
-# See https://registry.coder.com/modules/coder/code-server
 module "code-server" {
   count    = data.coder_workspace.me.start_count
   source   = "registry.coder.com/coder/code-server/coder"
@@ -178,7 +197,6 @@ module "code-server" {
   order    = 1
 }
 
-# See https://registry.coder.com/modules/coder/jetbrains
 module "jetbrains" {
   count      = data.coder_workspace.me.start_count
   source     = "registry.coder.com/coder/jetbrains/coder"
@@ -191,12 +209,10 @@ module "jetbrains" {
 # ---------------------------------------------------------------------------
 # OpenShell sandbox (replaces docker_container)
 #
-# This is the compute unit. Instead of a raw Docker container, the
-# workspace runs inside an OpenShell sandbox with:
-#   - Kernel-level filesystem isolation (Landlock)
-#   - Network policy enforcement (allow-list only)
-#   - Credential injection via openshell_provider (no env var leaks)
-#   - Optional inference routing to self-hosted models
+# The developer's workspace runs inside an OpenShell sandbox. When they
+# run `claude` or `codex`, the tool auto-detects the API key placeholder
+# in the environment and works out of the box. OpenShell's proxy handles
+# credential resolution transparently — no configuration needed.
 # ---------------------------------------------------------------------------
 
 resource "openshell_sandbox" "workspace" {
@@ -206,12 +222,8 @@ resource "openshell_sandbox" "workspace" {
   image = data.coder_parameter.image.value
   gpu   = data.coder_parameter.gpu.value == "true"
 
-  # Attach AI credential provider if selected.
-  providers = local.has_ai_provider ? [openshell_provider.ai[0].name] : []
+  providers = local.has_agent ? [openshell_provider.agent[0].name] : []
 
-  # The coder agent init script and token are passed as environment
-  # variables. The sandbox image entrypoint picks these up and starts
-  # the agent, which connects back to the Coder server.
   environment = {
     CODER_AGENT_TOKEN = coder_agent.main.token
     CODER_AGENT_URL   = data.coder_workspace.me.access_url
