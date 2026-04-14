@@ -3,9 +3,6 @@ terraform {
     coder = {
       source = "coder/coder"
     }
-    openshell = {
-      source = "nvidia/openshell"
-    }
   }
 }
 

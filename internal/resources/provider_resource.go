@@ -129,7 +129,11 @@ func (r *providerResource) Create(ctx context.Context, req resource.CreateReques
 		return
 	}
 
+	// Map server response but preserve planned credentials — the
+	// server typically doesn't echo secret values back.
+	plannedCreds := plan.Credentials
 	protoToModel(result.Provider, &plan)
+	plan.Credentials = plannedCreds
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -152,7 +156,10 @@ func (r *providerResource) Read(ctx context.Context, req resource.ReadRequest, r
 		return
 	}
 
+	// Preserve credentials from state — server doesn't echo secrets.
+	savedCreds := state.Credentials
 	protoToModel(result.Provider, &state)
+	state.Credentials = savedCreds
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -186,7 +193,10 @@ func (r *providerResource) Update(ctx context.Context, req resource.UpdateReques
 		return
 	}
 
+	// Preserve credentials from plan — server doesn't echo secrets.
+	plannedCreds := plan.Credentials
 	protoToModel(result.Provider, &plan)
+	plan.Credentials = plannedCreds
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
